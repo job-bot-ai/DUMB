@@ -6345,13 +6345,9 @@ def setup_plex(install_only: bool = False, configure_only: bool = False):
         return False, error
     if configure_only and not os.path.exists(plex_media_server_dir):
         return False, f"Plex not installed at {plex_media_server_dir}."
-    pid_path = os.path.join(config_dir, "Plex Media Server", "plexmediaserver.pid")
-    if os.path.exists(pid_path):
-        try:
-            os.remove(pid_path)
-            logger.info("Removed stale Plex PID file at %s", pid_path)
-        except Exception as e:
-            logger.warning("Failed to remove Plex PID file at %s: %s", pid_path, e)
+    from utils.plex_settings import remove_stale_plex_pid_file
+
+    remove_stale_plex_pid_file(config_dir)
     dbrepair_cfg = config.get("dbrepair", {}) or {}
     dbrepair_dir = dbrepair_cfg.get("install_dir", "/data/dbrepair")
     try:

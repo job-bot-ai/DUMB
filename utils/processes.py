@@ -85,6 +85,10 @@ class ProcessHandler:
         self.auto_restart_lock = threading.Lock()
         self.auto_restart_thread = None
         self._intentional_stop_pids = set()
+        # Process groups whose launcher exited unexpectedly. Helpers spawned
+        # by the launcher (for example Plex Transcoder or Plex Tuner Service)
+        # stay in the group and must be cleared before a replacement starts.
+        self._orphaned_process_groups = {}
         self.preinstall_complete = False
         self.preinstalled_processes = set()
         self.preinstall_failures = {}
@@ -810,6 +814,12 @@ class ProcessHandler:
                 stdout_target = subprocess.DEVNULL
                 stderr_target = subprocess.DEVNULL
 
+            self._terminate_orphaned_process_group(internal_name)
+            if key == "plex" and isinstance(config_for_wait, dict):
+                from utils.plex_settings import remove_stale_plex_pid_file
+
+                remove_stale_plex_pid_file(config_for_wait.get("config_dir"))
+
             process = subprocess.Popen(
                 command,
                 stdout=stdout_target,
@@ -1002,6 +1012,8 @@ class ProcessHandler:
                     and not intentional_stop
                     and not self.shutting_down
                 ):
+                    # start_new_session makes the launcher PID the group ID.
+                    self._orphaned_process_groups[internal_name] = pid
                     reason = (
                         f"Exited with code {exit_code}"
                         if exit_code is not None
@@ -1100,6 +1112,59 @@ class ProcessHandler:
                 process.terminate()
             return None
 
+    def _terminate_orphaned_process_group(self, internal_name, wait_timeout=10):
+        """Terminate helpers left behind by a launcher that exited unexpectedly.
+
+        When a service such as Plex Media Server crashes, its transcoder and
+        tuner helpers keep running in the dead launcher's process group. They
+        hold ports, tuners, and transcode sessions, so the replacement instance
+        cannot recover until they are gone.
+        """
+        process_group = self._orphaned_process_groups.pop(internal_name, None)
+        if process_group is None:
+            return
+        # A tracked PID equal to the group ID means the ID now belongs to a
+        # different, live service session; never signal it.
+        if process_group == os.getpgrp() or process_group in self.processes:
+            return
+        if not self._process_group_alive(process_group):
+            return
+        self.logger.warning(
+            "Terminating processes left behind by the previous %s instance "
+            "(process group %s).",
+            internal_name,
+            process_group,
+        )
+        for sig, timeout in (
+            (signal.SIGTERM, wait_timeout),
+            (signal.SIGKILL, 5),
+        ):
+            try:
+                os.killpg(process_group, sig)
+            except ProcessLookupError:
+                return
+            except OSError as e:
+                self.logger.warning(
+                    "Failed to signal leftover %s process group %s: %s",
+                    internal_name,
+                    process_group,
+                    e,
+                )
+                return
+            deadline = time.monotonic() + timeout
+            while self._process_group_alive(process_group):
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.1)
+            else:
+                self.logger.info("Leftover %s processes terminated.", internal_name)
+                return
+        self.logger.error(
+            "Leftover %s process group %s remained active after SIGKILL.",
+            internal_name,
+            process_group,
+        )
+
     def stop_process(self, process_name, disable_restart=True):
         intentional_pid = None
         try:
@@ -1169,6 +1234,10 @@ class ProcessHandler:
                             wait_timeout,
                             attempt + 1,
                         )
+                        # Only orphaned helpers remain (for example a hung
+                        # transcoder); further grace windows just delay a
+                        # restart, so force the group down now.
+                        break
                     else:
                         self.logger.warning(
                             f"{process_description} process did not terminate within {wait_timeout} seconds on attempt {attempt + 1}."
@@ -1218,6 +1287,7 @@ class ProcessHandler:
                 self.logger.warning(
                     f"{process_description} was not found or has already been stopped."
                 )
+                self._terminate_orphaned_process_group(internal_name)
         except Exception as e:
             self.logger.error(
                 f"Error occurred while stopping {process_description}: {e}"

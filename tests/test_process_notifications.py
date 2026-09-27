@@ -144,6 +144,104 @@ class ProcessNotificationTests(unittest.TestCase):
         notify_event.assert_not_called()
         self.assertIn(1234, handler.processes)
 
+    @patch("utils.processes.notify_event")
+    def test_unplanned_exit_records_orphaned_process_group(self, _notify_event):
+        handler = self._handler_with_process()
+
+        with patch("utils.processes.os.waitpid", return_value=(1234, 0)):
+            handler.reap_zombies(None, None)
+
+        self.assertEqual({"Example": 1234}, handler._orphaned_process_groups)
+
+    @patch("utils.processes.notify_event")
+    def test_intentional_stop_does_not_record_orphaned_group(self, _notify_event):
+        handler = self._handler_with_process()
+        handler._intentional_stop_pids.add(1234)
+
+        with patch("utils.processes.os.waitpid", return_value=(1234, 0)):
+            handler.reap_zombies(None, None)
+
+        self.assertEqual({}, handler._orphaned_process_groups)
+
+    def test_orphaned_group_is_terminated_before_replacement(self):
+        handler = object.__new__(ProcessHandler)
+        handler.init_attributes(Mock())
+        handler._orphaned_process_groups["Plex Media Server"] = 1234
+        handler._process_group_alive = Mock(side_effect=[True, False])
+
+        with (
+            patch("utils.processes.os.getpgrp", return_value=4321),
+            patch("utils.processes.os.killpg") as killpg,
+        ):
+            handler._terminate_orphaned_process_group("Plex Media Server")
+
+        killpg.assert_called_once_with(1234, signal.SIGTERM)
+        self.assertEqual({}, handler._orphaned_process_groups)
+
+    def test_orphaned_group_escalates_to_sigkill(self):
+        handler = object.__new__(ProcessHandler)
+        handler.init_attributes(Mock())
+        handler._orphaned_process_groups["Plex Media Server"] = 1234
+        handler._process_group_alive = Mock(side_effect=[True, True, False])
+
+        with (
+            patch("utils.processes.os.getpgrp", return_value=4321),
+            patch("utils.processes.os.killpg") as killpg,
+        ):
+            handler._terminate_orphaned_process_group(
+                "Plex Media Server", wait_timeout=0
+            )
+
+        killpg.assert_has_calls(
+            [call(1234, signal.SIGTERM), call(1234, signal.SIGKILL)]
+        )
+
+    def test_orphaned_group_reused_by_tracked_service_is_not_signalled(self):
+        handler = self._handler_with_process(pid=1234, process_name="Other")
+        handler._orphaned_process_groups["Plex Media Server"] = 1234
+
+        with (
+            patch("utils.processes.os.getpgrp", return_value=4321),
+            patch("utils.processes.os.killpg") as killpg,
+        ):
+            handler._terminate_orphaned_process_group("Plex Media Server")
+
+        killpg.assert_not_called()
+        self.assertEqual({}, handler._orphaned_process_groups)
+
+    def test_stop_of_crashed_service_clears_orphaned_group(self):
+        handler = object.__new__(ProcessHandler)
+        handler.init_attributes(Mock())
+        handler._terminate_orphaned_process_group = Mock()
+
+        handler.stop_process("Plex Media Server")
+
+        handler._terminate_orphaned_process_group.assert_called_once_with(
+            "Plex Media Server"
+        )
+
+    def test_stop_does_not_repeat_grace_windows_for_orphaned_helpers(self):
+        handler = self._handler_with_process()
+        process = handler.process_names["Example"]
+        process.poll.return_value = 0
+        handler._get_shutdown_policy = Mock(
+            return_value={"max_attempts": 6, "wait_timeout": 0}
+        )
+        handler._signal_process_group = Mock(side_effect=[1234, 1234])
+        handler._process_group_alive = Mock(side_effect=[True, True, False, False])
+        handler._update_running_processes_file = Mock()
+
+        with patch("utils.processes.time.sleep") as sleep:
+            handler.stop_process("Example")
+
+        sleep.assert_not_called()
+        handler._signal_process_group.assert_has_calls(
+            [
+                call(process, signal.SIGTERM),
+                call(process, signal.SIGKILL, process_group=1234),
+            ]
+        )
+
     def test_managed_shutdown_signals_the_complete_process_group(self):
         process = Mock(pid=1234)
 

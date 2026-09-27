@@ -4,6 +4,27 @@ import defusedxml.ElementTree as ET
 import os
 
 
+def remove_stale_plex_pid_file(config_dir):
+    """Remove the PID file a crashed Plex Media Server leaves behind.
+
+    Callers must only invoke this while no managed Plex process is running.
+    A leftover PID file can match an unrelated process after PID reuse and
+    make Plex refuse to start.
+    """
+    if not config_dir:
+        return False
+    pid_path = os.path.join(config_dir, "Plex Media Server", "plexmediaserver.pid")
+    if not os.path.exists(pid_path):
+        return False
+    try:
+        os.remove(pid_path)
+        logger.info("Removed stale Plex PID file at %s", pid_path)
+        return True
+    except Exception as e:
+        logger.warning("Failed to remove Plex PID file at %s: %s", pid_path, e)
+        return False
+
+
 def patch_plex_config():
     config_path = CONFIG_MANAGER.get("plex", {}).get(
         "config_file", "/plex/Plex Media Server/Preferences.xml"
