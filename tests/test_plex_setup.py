@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from utils import setup as setup_module
+from utils.plex_settings import remove_stale_plex_pid_file
 
 
 class PlexSetupTests(unittest.TestCase):
@@ -53,6 +54,24 @@ class PlexSetupTests(unittest.TestCase):
                 )
 
             self.assertEqual(result, (False, "ownership failed"))
+
+
+class PlexPidFileTests(unittest.TestCase):
+    def test_removes_stale_pid_file(self):
+        with tempfile.TemporaryDirectory() as config_dir:
+            app_dir = os.path.join(config_dir, "Plex Media Server")
+            os.makedirs(app_dir)
+            pid_path = os.path.join(app_dir, "plexmediaserver.pid")
+            with open(pid_path, "w") as handle:
+                handle.write("123\n")
+
+            self.assertTrue(remove_stale_plex_pid_file(config_dir))
+            self.assertFalse(os.path.exists(pid_path))
+
+    def test_missing_pid_file_is_a_no_op(self):
+        with tempfile.TemporaryDirectory() as config_dir:
+            self.assertFalse(remove_stale_plex_pid_file(config_dir))
+        self.assertFalse(remove_stale_plex_pid_file(None))
 
 
 if __name__ == "__main__":
